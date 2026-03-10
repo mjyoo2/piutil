@@ -213,6 +213,7 @@ def _load_columns_from_lerobot(
     repo_id: str,
     columns: Sequence[str],
     *,
+    root: str | pathlib.Path | None = None,
     max_frames: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Load specific columns from a LeRobot dataset as numpy arrays.
@@ -225,8 +226,10 @@ def _load_columns_from_lerobot(
     2. datasets.load_dataset (fallback — re-parses parquet files)
 
     Args:
-        repo_id: HuggingFace repo id (e.g. "lerobot/aloha_sim_insertion_human").
+        repo_id: HuggingFace repo id or local dataset name.
         columns: Column names to load (e.g. ["observation.state", "action"]).
+        root: Local directory containing the dataset. If provided, loads from
+              disk instead of HuggingFace Hub.
         max_frames: Max number of frames to read. None = all.
 
     Returns:
@@ -234,16 +237,21 @@ def _load_columns_from_lerobot(
     """
     hf_ds = None
 
-    # Strategy 1: LeRobotDataset.hf_dataset (pre-cached Arrow, ~0.1s)
+    # Strategy 1: LeRobotDataset.hf_dataset
+    # LeRobotDataset automatically resolves local cache (HF_LEROBOT_HOME/repo_id)
+    # and falls back to Hub download if not found locally.
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        ds = LeRobotDataset(repo_id)
+        kwargs = {"download_videos": False}
+        if root is not None:
+            kwargs["root"] = root
+        ds = LeRobotDataset(repo_id, **kwargs)
         hf_ds = ds.hf_dataset
-        logger.info(f"Loaded via LeRobotDataset.hf_dataset ({len(hf_ds)} rows)")
+        logger.info(f"Loaded via LeRobotDataset ({len(hf_ds)} rows, root={ds.root})")
     except Exception as e:
         logger.warning(f"LeRobotDataset failed ({e}), falling back to load_dataset")
 
-    # Strategy 2: load_dataset (re-parses parquet, slower)
+    # Strategy 2: load_dataset (fallback for non-LeRobot datasets)
     if hf_ds is None:
         from datasets import load_dataset
         hf_ds = load_dataset(repo_id, split="train")
@@ -284,6 +292,7 @@ def compute_norm_stats_lerobot(
     repo_id: str,
     *,
     keys: Sequence[str] | None = None,
+    root: str | pathlib.Path | None = None,
     compute_quantiles: bool = True,
     max_frames: int | None = None,
 ) -> dict[str, NormStats]:
@@ -294,8 +303,10 @@ def compute_norm_stats_lerobot(
     transform pipeline.
 
     Args:
-        repo_id: HuggingFace repo id.
+        repo_id: HuggingFace repo id or local dataset name.
         keys: Column names to compute stats for. Default: ["observation.state", "action"].
+        root: Local directory containing the dataset. If provided, loads from
+              disk instead of HuggingFace Hub.
         compute_quantiles: Whether to compute q01/q99.
         max_frames: Stop after this many frames. None = all.
 
@@ -315,7 +326,7 @@ def compute_norm_stats_lerobot(
     t0 = time.perf_counter()
 
     # Single bulk read — all data loaded at once from Arrow
-    data = _load_columns_from_lerobot(repo_id, list(keys), max_frames=max_frames)
+    data = _load_columns_from_lerobot(repo_id, list(keys), root=root, max_frames=max_frames)
 
     t_load = time.perf_counter() - t0
     n_samples = next((v.shape[0] for v in data.values()), 0)
@@ -459,6 +470,8 @@ def _cli():
                         help="OpenPI config name (requires openpi installed)")
     parser.add_argument("--repo-id", type=str, default=None,
                         help="LeRobot HF repo id (direct mode, no OpenPI needed)")
+    parser.add_argument("--root", type=str, default=None,
+                        help="Local directory containing the dataset (skip Hub download)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory for norm_stats.json")
     parser.add_argument("--max-frames", type=int, default=None,
@@ -486,6 +499,7 @@ def _cli():
         logger.info(f"Computing norm stats for {args.repo_id}")
         stats = compute_norm_stats_lerobot(
             args.repo_id,
+            root=args.root,
             compute_quantiles=compute_quantiles,
             max_frames=args.max_frames,
         )
@@ -515,6 +529,7 @@ def _cli():
         logger.info(f"Computing norm stats for config '{args.config_name}' (repo: {repo_id})")
         stats = compute_norm_stats_lerobot(
             repo_id,
+            root=args.root,
             compute_quantiles=compute_quantiles,
             max_frames=args.max_frames,
         )
