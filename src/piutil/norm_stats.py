@@ -240,8 +240,12 @@ def _load_columns_from_lerobot(
     # Strategy 1: LeRobotDataset.hf_dataset
     # LeRobotDataset automatically resolves local cache (HF_LEROBOT_HOME/repo_id)
     # and falls back to Hub download if not found locally.
+    # Supports both lerobot v0.4+ (lerobot.datasets) and older (lerobot.common.datasets).
     try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ImportError:
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
         kwargs = {"download_videos": False}
         if root is not None:
             kwargs["root"] = root
