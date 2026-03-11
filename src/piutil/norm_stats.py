@@ -108,7 +108,7 @@ class RunningStats:
         Args:
             batch: Array where all dimensions except the last are batch dimensions.
         """
-        batch = np.asarray(batch, dtype=np.float64).reshape(-1, batch.shape[-1])
+        batch = np.asarray(batch).reshape(-1, batch.shape[-1])
         n, d = batch.shape
 
         batch_mean = batch.mean(axis=0)
