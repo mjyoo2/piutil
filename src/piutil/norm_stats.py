@@ -5,8 +5,9 @@ Drop-in replacement for OpenPI's `scripts/compute_norm_stats.py`.
 Key optimizations:
 1. Data loading: Read state/action columns directly from HF Arrow table,
    skipping image decoding and transform pipeline entirely.
-2. Computation: Vectorized histogram updates, skip histograms when quantiles
-   are not needed.
+2. Computation: Vectorized histogram updates via np.searchsorted + np.add.at,
+   skip histograms when quantiles are not needed.
+3. Chunked Arrow reads with tqdm progress bars.
 
 Usage as OpenPI replacement:
     # Instead of: python scripts/compute_norm_stats.py <config_name>
@@ -45,6 +46,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+_CHUNK_SIZE = 50_000
+
 
 @dataclass
 class NormStats:
@@ -78,10 +81,8 @@ class NormStats:
 class RunningStats:
     """Compute running mean/std/quantiles over batches of vectors.
 
-    Optimizations vs OpenPI's RunningStats:
-    - Histogram updates are fully vectorized (no per-dimension Python loop)
-    - Histogram computation can be skipped entirely (compute_quantiles=False)
-    - Bin edge adjustment uses vectorized operations
+    Produces results identical to OpenPI's RunningStats.
+    Optional: set compute_quantiles=False to skip histogram computation.
     """
 
     def __init__(self, compute_quantiles: bool = True, num_bins: int = 5000):
@@ -107,7 +108,7 @@ class RunningStats:
         Args:
             batch: Array where all dimensions except the last are batch dimensions.
         """
-        batch = np.asarray(batch).reshape(-1, batch.shape[-1])
+        batch = np.asarray(batch, dtype=np.float64).reshape(-1, batch.shape[-1])
         n, d = batch.shape
 
         batch_mean = batch.mean(axis=0)
@@ -147,14 +148,16 @@ class RunningStats:
             self._update_histograms_vectorized(batch)
 
     def _update_histograms_vectorized(self, batch: np.ndarray) -> None:
-        """Vectorized histogram update (matches np.histogram bin assignment)."""
-        edges = self._bin_edges
-        for i in range(batch.shape[1]):
-            # np.histogram uses side='right' then subtracts 1, so values on
-            # a bin edge go into the left bin.  Replicate that logic here.
-            indices = np.searchsorted(edges[i], batch[:, i], side='right') - 1
-            indices = np.clip(indices, 0, self._num_bins - 1)
-            np.add.at(self._histograms[i], indices, 1)
+        """Update histograms using fully vectorized searchsorted + add.at."""
+        n, d = batch.shape
+        # searchsorted per dim — (d, n) indices
+        # Clip to [0, num_bins-1] so values at edges land in valid bins
+        indices = np.empty((d, n), dtype=np.intp)
+        for i in range(d):
+            indices[i] = np.searchsorted(self._bin_edges[i, 1:-1], batch[:, i])
+        # Scatter-add counts — one add.at per dim (no Python per-sample loop)
+        for i in range(d):
+            np.add.at(self._histograms[i], indices[i], 1)
 
     def _adjust_histograms(self) -> None:
         """Redistribute histograms when min/max changes (matches OpenPI)."""
@@ -167,7 +170,6 @@ class RunningStats:
         new_histograms = np.zeros_like(self._histograms)
         for i in range(d):
             if self._histograms[i].sum() > 0:
-                # OpenPI uses np.histogram(old_edges[:-1], bins=new_edges, weights=old_hist)
                 new_histograms[i], _ = np.histogram(
                     self._bin_edges[i, :-1], bins=new_edges[i], weights=self._histograms[i]
                 )
@@ -181,31 +183,26 @@ class RunningStats:
             raise ValueError("Need at least 2 samples to compute statistics.")
 
         variance = self._mean_sq - self._mean ** 2
-        std = np.sqrt(np.maximum(0, variance)).astype(np.float32)
-        mean = self._mean.astype(np.float32)
+        std = np.sqrt(np.maximum(0, variance))
+        mean = self._mean
 
         q01, q99 = None, None
         if self._compute_quantiles and self._histograms is not None:
             q01, q99 = self._compute_quantile_values([0.01, 0.99])
-            q01 = q01.astype(np.float32)
-            q99 = q99.astype(np.float32)
 
         return NormStats(mean=mean, std=std, q01=q01, q99=q99)
 
     def _compute_quantile_values(self, quantiles: list[float]) -> list[np.ndarray]:
-        """Compute quantiles from histograms."""
+        """Compute quantiles from histograms (matches OpenPI exactly)."""
         results = []
         for q in quantiles:
             target = q * self._count
-            cumsum = np.cumsum(self._histograms, axis=1)
-            indices = np.array([
-                np.searchsorted(cumsum[i], target) for i in range(cumsum.shape[0])
-            ])
-            indices = np.clip(indices, 0, self._num_bins - 1)
-            values = np.array([
-                self._bin_edges[i, idx] for i, idx in enumerate(indices)
-            ])
-            results.append(values)
+            q_values = []
+            for i in range(self._histograms.shape[0]):
+                cumsum = np.cumsum(self._histograms[i])
+                idx = np.searchsorted(cumsum, target)
+                q_values.append(self._bin_edges[i, idx])
+            results.append(np.array(q_values))
         return results
 
 
@@ -213,38 +210,18 @@ class RunningStats:
 # Data loading: fast paths that bypass image decoding
 # ---------------------------------------------------------------------------
 
-def _load_columns_from_lerobot(
+def _open_lerobot_dataset(
     repo_id: str,
     columns: Sequence[str],
     *,
     root: str | pathlib.Path | None = None,
-    max_frames: int | None = None,
-) -> dict[str, np.ndarray]:
-    """Load specific columns from a LeRobot dataset as numpy arrays.
+):
+    """Open a LeRobot/HF dataset and return (hf_dataset, use_columns).
 
-    Reads directly from the underlying HF Arrow table in a single bulk read,
-    bypassing video decoding and the transform pipeline entirely.
-
-    Tries two strategies in order:
-    1. LeRobotDataset.hf_dataset (fastest — uses cached Arrow table)
-    2. datasets.load_dataset (fallback — re-parses parquet files)
-
-    Args:
-        repo_id: HuggingFace repo id or local dataset name.
-        columns: Column names to load (e.g. ["observation.state", "action"]).
-        root: Local directory containing the dataset. If provided, loads from
-              disk instead of HuggingFace Hub.
-        max_frames: Max number of frames to read. None = all.
-
-    Returns:
-        Dict mapping column names to numpy arrays of shape (N, dim).
+    Does NOT read data — just opens the Arrow table and validates columns.
     """
     hf_ds = None
 
-    # Strategy 1: LeRobotDataset.hf_dataset
-    # LeRobotDataset automatically resolves local cache (HF_LEROBOT_HOME/repo_id)
-    # and falls back to Hub download if not found locally.
-    # Supports both lerobot v0.4+ (lerobot.datasets) and older (lerobot.common.datasets).
     try:
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -259,13 +236,11 @@ def _load_columns_from_lerobot(
     except Exception as e:
         logger.warning(f"LeRobotDataset failed ({e}), falling back to load_dataset")
 
-    # Strategy 2: load_dataset (fallback for non-LeRobot datasets)
     if hf_ds is None:
         from datasets import load_dataset
         hf_ds = load_dataset(repo_id, split="train")
         logger.info(f"Loaded via load_dataset ({len(hf_ds)} rows)")
 
-    # Filter to available columns
     available = set(hf_ds.column_names)
     use_columns = [c for c in columns if c in available]
     if not use_columns:
@@ -277,23 +252,27 @@ def _load_columns_from_lerobot(
     if missing:
         logger.warning(f"Columns not found in HF dataset (skipped): {missing}")
 
-    # Select only needed columns and read everything at once (Arrow is columnar,
-    # so selecting columns first avoids touching image/video data)
     hf_ds = hf_ds.select_columns(use_columns)
-    total = len(hf_ds) if max_frames is None else min(max_frames, len(hf_ds))
+    return hf_ds, use_columns
 
-    # Single bulk read — Arrow columnar read, no per-row overhead
-    raw = hf_ds[:total]
 
-    result = {}
-    for col in use_columns:
-        arr = np.array(raw[col])
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        result[col] = arr
-
-    logger.info(f"Read {total} frames, columns: {use_columns}")
-    return result
+def _iter_chunks(
+    hf_ds,
+    columns: Sequence[str],
+    total: int,
+    chunk_size: int = _CHUNK_SIZE,
+) -> Iterator[dict[str, np.ndarray]]:
+    """Yield chunked numpy arrays from an HF dataset."""
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        raw = hf_ds[start:end]
+        chunk = {}
+        for col in columns:
+            arr = np.asarray(raw[col], dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            chunk[col] = arr
+        yield chunk
 
 
 def compute_norm_stats_lerobot(
@@ -303,11 +282,12 @@ def compute_norm_stats_lerobot(
     root: str | pathlib.Path | None = None,
     compute_quantiles: bool = True,
     max_frames: int | None = None,
+    chunk_size: int = _CHUNK_SIZE,
 ) -> dict[str, NormStats]:
     """Compute norm stats directly from a LeRobot HF dataset.
 
     This is the fastest path: reads state/action columns directly from the Arrow
-    table in a single bulk read, completely bypassing video decoding and the
+    table in chunked reads, completely bypassing video decoding and the
     transform pipeline.
 
     Args:
@@ -317,6 +297,7 @@ def compute_norm_stats_lerobot(
               disk instead of HuggingFace Hub.
         compute_quantiles: Whether to compute q01/q99.
         max_frames: Stop after this many frames. None = all.
+        chunk_size: Number of rows per chunk for Arrow reads.
 
     Returns:
         Dict mapping key names to NormStats. Keys are remapped to OpenPI convention:
@@ -325,7 +306,6 @@ def compute_norm_stats_lerobot(
     if keys is None:
         keys = ["observation.state", "action"]
 
-    # OpenPI key mapping: dataset column -> norm_stats key
     key_remap = {
         "observation.state": "state",
         "action": "actions",
@@ -333,24 +313,45 @@ def compute_norm_stats_lerobot(
 
     t0 = time.perf_counter()
 
-    # Single bulk read — all data loaded at once from Arrow
-    data = _load_columns_from_lerobot(repo_id, list(keys), root=root, max_frames=max_frames)
+    hf_ds, use_columns = _open_lerobot_dataset(repo_id, list(keys), root=root)
+    total = len(hf_ds) if max_frames is None else min(max_frames, len(hf_ds))
 
-    t_load = time.perf_counter() - t0
-    n_samples = next((v.shape[0] for v in data.values()), 0)
-    logger.info(f"[norm_stats] Data loaded: {n_samples} samples in {t_load:.2f}s")
+    t_open = time.perf_counter() - t0
+    logger.info(f"[norm_stats] Dataset opened: {total} frames in {t_open:.2f}s")
 
-    # Compute stats — single update call per key (entire dataset at once)
-    result = {}
+    # Build per-key RunningStats
+    stats: dict[str, RunningStats] = {}
     for key in keys:
-        if key not in data:
-            continue
-        rs = RunningStats(compute_quantiles=compute_quantiles)
-        rs.update(data[key])
+        if key in use_columns:
+            stats[key] = RunningStats(compute_quantiles=compute_quantiles)
+
+    # Chunked iteration with progress bar
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total, unit="rows", desc="Computing norm stats")
+    except ImportError:
+        pbar = None
+
+    for chunk in _iter_chunks(hf_ds, use_columns, total, chunk_size=chunk_size):
+        chunk_n = 0
+        for key, rs in stats.items():
+            if key in chunk:
+                rs.update(chunk[key])
+                chunk_n = chunk[key].shape[0]
+        if pbar is not None:
+            pbar.update(chunk_n)
+
+    if pbar is not None:
+        pbar.close()
+
+    # Build result
+    result = {}
+    for key, rs in stats.items():
         out_key = key_remap.get(key, key)
         result[out_key] = rs.get_statistics()
 
     elapsed = time.perf_counter() - t0
+    n_samples = next((rs.count for rs in stats.values()), 0)
     logger.info(
         f"[norm_stats] Done: {n_samples} samples in {elapsed:.2f}s "
         f"({n_samples / elapsed:.0f} samples/s)"
@@ -369,7 +370,7 @@ def compute_norm_stats(
     *,
     compute_quantiles: bool = True,
     max_frames: int | None = None,
-    log_every: int = 100,
+    total_batches: int | None = None,
 ) -> dict[str, NormStats]:
     """Compute normalization statistics from a data iterator.
 
@@ -378,7 +379,7 @@ def compute_norm_stats(
         keys: Keys to compute stats for. Default: ["state", "actions"].
         compute_quantiles: Whether to compute q01/q99 (slower).
         max_frames: Stop after this many frames.
-        log_every: Print progress every N batches.
+        total_batches: Total number of batches (for progress bar).
 
     Returns:
         Dict mapping key names to NormStats.
@@ -389,10 +390,15 @@ def compute_norm_stats(
     stats = {key: RunningStats(compute_quantiles=compute_quantiles) for key in keys}
 
     total_samples = 0
-    num_batches = 0
     t0 = time.perf_counter()
 
-    for batch in data_iter:
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(data_iter, total=total_batches, unit="batch", desc="Computing norm stats")
+    except ImportError:
+        pbar = data_iter
+
+    for batch in pbar:
         for key in keys:
             if key not in batch:
                 continue
@@ -405,23 +411,17 @@ def compute_norm_stats(
             0,
         )
         total_samples += batch_n
-        num_batches += 1
 
         if max_frames is not None and total_samples >= max_frames:
             break
 
-        if log_every > 0 and num_batches % log_every == 0:
-            elapsed = time.perf_counter() - t0
-            rate = total_samples / elapsed if elapsed > 0 else 0
-            logger.info(
-                f"[norm_stats] {num_batches} batches | {total_samples} samples | "
-                f"{rate:.0f} samples/s | {elapsed:.1f}s"
-            )
+    if hasattr(pbar, 'close'):
+        pbar.close()
 
     elapsed = time.perf_counter() - t0
     rate = total_samples / elapsed if elapsed > 0 else 0
     logger.info(
-        f"[norm_stats] Done: {num_batches} batches, {total_samples} samples "
+        f"[norm_stats] Done: {total_samples} samples "
         f"in {elapsed:.1f}s ({rate:.0f} samples/s)"
     )
 
@@ -486,6 +486,8 @@ def _cli():
                         help="Max number of frames to process")
     parser.add_argument("--no-quantiles", action="store_true",
                         help="Skip quantile computation (much faster)")
+    parser.add_argument("--chunk-size", type=int, default=_CHUNK_SIZE,
+                        help=f"Rows per chunk for Arrow reads (default: {_CHUNK_SIZE})")
 
     args = parser.parse_args()
 
@@ -498,7 +500,6 @@ def _cli():
     compute_quantiles = not args.no_quantiles
 
     if args.repo_id is not None:
-        # Direct mode: no OpenPI dependency
         output = args.output
         if output is None:
             safe_name = args.repo_id.replace("/", "_")
@@ -510,11 +511,11 @@ def _cli():
             root=args.root,
             compute_quantiles=compute_quantiles,
             max_frames=args.max_frames,
+            chunk_size=args.chunk_size,
         )
         save_norm_stats(stats, output)
 
     elif args.config_name is not None:
-        # OpenPI config mode
         try:
             import openpi.training.config as _config
         except ImportError:
@@ -540,6 +541,7 @@ def _cli():
             root=args.root,
             compute_quantiles=compute_quantiles,
             max_frames=args.max_frames,
+            chunk_size=args.chunk_size,
         )
         save_norm_stats(stats, output)
 
