@@ -147,14 +147,17 @@ class RunningStats:
             self._update_histograms_vectorized(batch)
 
     def _update_histograms_vectorized(self, batch: np.ndarray) -> None:
-        """Vectorized histogram update."""
+        """Vectorized histogram update (matches np.histogram bin assignment)."""
         edges = self._bin_edges
         for i in range(batch.shape[1]):
-            indices = np.searchsorted(edges[i, 1:-1], batch[:, i])
+            # np.histogram uses side='right' then subtracts 1, so values on
+            # a bin edge go into the left bin.  Replicate that logic here.
+            indices = np.searchsorted(edges[i], batch[:, i], side='right') - 1
+            indices = np.clip(indices, 0, self._num_bins - 1)
             np.add.at(self._histograms[i], indices, 1)
 
     def _adjust_histograms(self) -> None:
-        """Redistribute histograms when min/max changes."""
+        """Redistribute histograms when min/max changes (matches OpenPI)."""
         d = self._histograms.shape[0]
         new_edges = np.column_stack([
             np.linspace(self._min[i], self._max[i], self._num_bins + 1)
@@ -164,9 +167,10 @@ class RunningStats:
         new_histograms = np.zeros_like(self._histograms)
         for i in range(d):
             if self._histograms[i].sum() > 0:
-                old_centers = 0.5 * (self._bin_edges[i, :-1] + self._bin_edges[i, 1:])
-                indices = np.searchsorted(new_edges[i, 1:-1], old_centers)
-                np.add.at(new_histograms[i], indices, self._histograms[i])
+                # OpenPI uses np.histogram(old_edges[:-1], bins=new_edges, weights=old_hist)
+                new_histograms[i], _ = np.histogram(
+                    self._bin_edges[i, :-1], bins=new_edges[i], weights=self._histograms[i]
+                )
 
         self._histograms = new_histograms
         self._bin_edges = new_edges
