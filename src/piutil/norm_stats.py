@@ -107,7 +107,7 @@ class RunningStats:
         Args:
             batch: Array where all dimensions except the last are batch dimensions.
         """
-        batch = np.asarray(batch, dtype=np.float64).reshape(-1, batch.shape[-1])
+        batch = np.asarray(batch).reshape(-1, batch.shape[-1])
         n, d = batch.shape
 
         batch_mean = batch.mean(axis=0)
@@ -122,7 +122,7 @@ class RunningStats:
             self._max = batch_max
 
             if self._compute_quantiles:
-                self._histograms = np.zeros((d, self._num_bins), dtype=np.float64)
+                self._histograms = np.zeros((d, self._num_bins))
                 self._bin_edges = np.column_stack([
                     np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_bins + 1)
                     for i in range(d)
